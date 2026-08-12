@@ -7,7 +7,7 @@ import time
 from aiogram import Bot, Router
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
-from aiogram.types import ChatPermissions, Message
+from aiogram.types import ChatPermissions, Message, ReplyParameters
 
 from .challenge import generate_challenge
 from .database import ChallengeRecord, Database
@@ -21,8 +21,12 @@ user_locks: defaultdict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Loc
 async def safe_delete(bot: Bot, chat_id: int, message_id: int) -> None:
     try:
         await bot.delete_message(chat_id, message_id)
+        logger.info("Message deleted: chat_id=%s message_id=%s", chat_id, message_id)
     except TelegramBadRequest as error:
-        logger.debug("Message %s/%s was already unavailable: %s", chat_id, message_id, error)
+        logger.warning(
+            "Message delete rejected or message already unavailable: chat_id=%s message_id=%s error=%s",
+            chat_id, message_id, error,
+        )
     except TelegramAPIError:
         logger.exception("Telegram API error while deleting message %s/%s", chat_id, message_id)
 
@@ -38,15 +42,48 @@ async def send_new_challenge(
     generated = generate_challenge()
     options = await db.get_bot_settings()
     timeout_minutes = int(options["challenge_timeout_minutes"])
-    challenge_message = await bot.send_message(message.chat.id, generated.text(timeout_minutes))
+    logger.info(
+        "Sending challenge: chat_id=%s user_id=%s source_message_id=%s thread_id=%s expression=%s %s %s",
+        message.chat.id, user_id, message.message_id,
+        message.message_thread_id,
+        generated.left, generated.operator, generated.right,
+    )
+    try:
+        challenge_message = await bot.send_message(
+            message.chat.id,
+            generated.text(timeout_minutes),
+            message_thread_id=message.message_thread_id,
+            reply_parameters=ReplyParameters(
+                message_id=message.message_id,
+                allow_sending_without_reply=True,
+            ),
+        )
+    except TelegramAPIError:
+        logger.exception(
+            "Challenge send failed: chat_id=%s user_id=%s source_message_id=%s",
+            message.chat.id, user_id, message.message_id,
+        )
+        raise
+    logger.info(
+        "Challenge message sent: chat_id=%s user_id=%s source_message_id=%s thread_id=%s challenge_message_id=%s",
+        message.chat.id, user_id, message.message_id, message.message_thread_id,
+        challenge_message.message_id,
+    )
     expires_at = time.time() + timeout_minutes * 60
     inserted = await db.add_challenge(
         message.chat.id, user_id, generated.answer, challenge_message.message_id, expires_at
     )
     if not inserted:
+        logger.warning(
+            "Challenge was not stored, deleting sent challenge: chat_id=%s user_id=%s challenge_message_id=%s",
+            message.chat.id, user_id, challenge_message.message_id,
+        )
         await safe_delete(bot, message.chat.id, challenge_message.message_id)
         return
-    logger.info("Challenge started: chat_id=%s user_id=%s", message.chat.id, user_id)
+    logger.info(
+        "Challenge started: chat_id=%s user_id=%s challenge_message_id=%s expires_at=%s",
+        message.chat.id, user_id, challenge_message.message_id, expires_at,
+    )
 
 
 async def handle_answer(
@@ -100,17 +137,33 @@ async def on_message(message: Message, bot: Bot, db: Database) -> None:
     await db.remember_group(message.chat.id, message.chat.title or str(message.chat.id))
     # Joining/leaving service messages are not attempts to write. A challenge
     # starts only when the user sends an actual message in the group.
-    # Messages authored by a channel (including linked-channel forwards) are
-    # not regular users and must never receive a challenge.
+    # Service messages and automatic forwards are not attempts to write.
+    # Messages sent as a group/channel are checked when Telegram also provides
+    # the actual sender in from_user; without it there is nobody to mute or
+    # associate an answer with.
     if (
         message.new_chat_members
         or message.left_chat_member
-        or message.sender_chat is not None
         or message.is_automatic_forward
     ):
         return
-    if message.from_user is None or message.from_user.is_bot:
+    if message.from_user is None:
+        if message.sender_chat is not None:
+            logger.warning(
+                "Group-sent message cannot be checked because sender is unavailable: "
+                "chat_id=%s message_id=%s sender_chat_id=%s",
+                message.chat.id, message.message_id, message.sender_chat.id,
+            )
         return
+    if message.from_user.is_bot:
+        return
+
+    logger.info(
+        "Group message received: chat_id=%s message_id=%s user_id=%s sender_chat_id=%s content_type=%s",
+        message.chat.id, message.message_id, message.from_user.id,
+        message.sender_chat.id if message.sender_chat is not None else None,
+        message.content_type,
+    )
 
     try:
         member = await bot.get_chat_member(message.chat.id, message.from_user.id)
@@ -118,8 +171,16 @@ async def on_message(message: Message, bot: Bot, db: Database) -> None:
         logger.exception("Telegram API error while checking member status")
         return
     if member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
+        logger.info(
+            "Group message ignored because sender is admin: chat_id=%s message_id=%s user_id=%s status=%s",
+            message.chat.id, message.message_id, message.from_user.id, member.status,
+        )
         return
     if await db.is_verified(message.chat.id, message.from_user.id):
+        logger.info(
+            "Group message ignored because sender is verified: chat_id=%s message_id=%s user_id=%s",
+            message.chat.id, message.message_id, message.from_user.id,
+        )
         return
 
     key = (message.chat.id, message.from_user.id)
@@ -133,8 +194,8 @@ async def on_message(message: Message, bot: Bot, db: Database) -> None:
             await safe_delete(bot, message.chat.id, record.challenge_message_id)
             logger.info("Challenge timed out: chat_id=%s user_id=%s", *key)
 
-        await safe_delete(bot, message.chat.id, message.message_id)
         await send_new_challenge(message, bot, db, message.from_user.id)
+        await safe_delete(bot, message.chat.id, message.message_id)
 
 
 async def cleanup_expired(bot: Bot, db: Database) -> None:
